@@ -1,0 +1,24 @@
+# USB Monitor
+
+# Build artifacts
+dist/
+build/
+*.spec
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Reasonix internal
+.reasonix/
+
+# Test
+_test_*.py
+
+# OS
+Thumbs.db
+.DS_Store

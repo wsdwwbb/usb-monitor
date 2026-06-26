@@ -1,0 +1,6 @@
+# USB Monitor 依赖
+# 核心功能:
+pywin32>=306       # Windows COM/WMI 接口（推荐，功能更全）
+# 备选方案: 不安装 pywin32 时自动使用 wmic 命令行模式
+
+# GUI 使用内置 tkinter，无需额外依赖
