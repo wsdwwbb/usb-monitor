@@ -22,3 +22,7 @@ _test_*.py
 # OS
 Thumbs.db
 .DS_Store
+
+# Local config (GitHub token etc.)
+.github_config
+_upload.*
