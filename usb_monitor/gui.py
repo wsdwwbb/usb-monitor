@@ -11,8 +11,8 @@ import threading
 import time
 from typing import Dict, List, Optional, Tuple
 
-from usb_monitor.core import USBDevice, DeviceGroup, group_devices
-from usb_monitor.core import enum_usb_devices, enum_usb_devices_fast
+from usb_monitor.core import USBDevice, DeviceGroup, group_devices, GhostComPort
+from usb_monitor.core import enum_usb_devices, enum_usb_devices_fast, scan_ghost_com_ports
 
 
 try:
@@ -77,6 +77,11 @@ class USBGUI:
             toolbar, text="▶ 实时监控", command=self.toggle_monitor
         )
         self.btn_monitor.pack(side=tk.LEFT, padx=4)
+
+        self.btn_cleanup = ttk.Button(
+            toolbar, text="🧹 清理 COM 口", command=self._cleanup_com_ports
+        )
+        self.btn_cleanup.pack(side=tk.LEFT, padx=4)
 
         self.cb_group = ttk.Checkbutton(
             toolbar, text="按设备分组",
@@ -297,6 +302,137 @@ class USBGUI:
                     tags=(status_tag,),
                 )
 
+    # ── 窗口居中辅助 ──────────────────────────────────────────────────
+
+    @staticmethod
+    def _center_window(win: tk.Toplevel, width: int, height: int):
+        """将子窗口居中于主窗口显示。"""
+        win.update_idletasks()
+        try:
+            px = win.master.winfo_x()
+            py = win.master.winfo_y()
+            pw = win.master.winfo_width()
+            ph = win.master.winfo_height()
+            x = px + (pw - width) // 2
+            y = py + (ph - height) // 2
+        except Exception:
+            x = (win.winfo_screenwidth() - width) // 2
+            y = (win.winfo_screenheight() - height) // 2
+        win.geometry(f"{width}x{height}+{x}+{y}")
+
+    # ── 幽灵 COM 口清理 ──────────────────────────────────────────────────
+
+    def _cleanup_com_ports(self):
+        """扫描并清理幽灵 COM 口。"""
+        # 扫描
+        try:
+            ghosts = scan_ghost_com_ports()
+        except Exception as e:
+            messagebox.showerror("错误", f"扫描失败: {e}")
+            return
+
+        if not ghosts:
+            messagebox.showinfo("清理 COM 口", "没有发现幽灵 COM 口，所有 COM 编号均有设备占用。")
+            return
+
+        # 弹出选择对话框
+        top = tk.Toplevel(self.root)
+        top.title("幽灵 COM 口清理")
+        top.transient(self.root)
+        top.grab_set()
+        # 居中显示于主窗口
+        self._center_window(top, 550, 380)
+
+        ttk.Label(top, text=f"发现 {len(ghosts)} 个幽灵 COM 口（设备已拔出、COM 编号被残留占用）",
+                  font=("", 10)).pack(pady=(10, 5))
+
+        frame = ttk.Frame(top, padding="6")
+        frame.pack(fill=tk.BOTH, expand=True)
+
+        # 列表
+        columns = ("port", "device", "vid_pid")
+        tree = ttk.Treeview(frame, columns=columns, show="headings",
+                            height=10, selectmode="extended")
+        tree.heading("port", text="COM 口")
+        tree.heading("device", text="设备名称")
+        tree.heading("vid_pid", text="VID:PID")
+        tree.column("port", width=60)
+        tree.column("device", width=260)
+        tree.column("vid_pid", width=180)
+
+        vscroll = ttk.Scrollbar(frame, orient=tk.VERTICAL, command=tree.yview)
+        tree.configure(yscrollcommand=vscroll.set)
+        tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        vscroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        for g in ghosts:
+            tree.insert("", tk.END, iid=g.port, values=(
+                g.port,
+                g.device_name[:60] if g.device_name else "(未知设备)",
+                g.vid_pid,
+            ))
+
+        # 全选 / 反选
+        sel_frame = ttk.Frame(top, padding="6 0 6 6")
+        sel_frame.pack(fill=tk.X)
+
+        def select_all():
+            for item in tree.get_children():
+                tree.selection_add(item)
+
+        def deselect_all():
+            for item in tree.get_children():
+                tree.selection_remove(item)
+
+        ttk.Button(sel_frame, text="全选", command=select_all).pack(side=tk.LEFT, padx=2)
+        ttk.Button(sel_frame, text="取消全选", command=deselect_all).pack(side=tk.LEFT, padx=2)
+
+        # 底部按钮
+        btn_frame = ttk.Frame(top, padding="6")
+        btn_frame.pack(fill=tk.X)
+
+        ttk.Label(btn_frame, text="⚠ 需要管理员权限",
+                  foreground="#c62828", font=("", 9)).pack(side=tk.LEFT)
+
+        def do_cleanup():
+            selected = tree.selection()
+            if not selected:
+                messagebox.showwarning("提示", "请先选择要清理的 COM 口", parent=top)
+                return
+
+            if not messagebox.askyesno("确认",
+                    f"确定要删除 {len(selected)} 个幽灵 COM 口的注册表记录？\n"
+                    "此操作需要管理员权限。", parent=top):
+                return
+
+            from usb_monitor.core import cleanup_ghost_com_port
+
+            top.destroy()
+
+            results = []
+            for port_name in selected:
+                # 找到对应的 ghost port 对象
+                g = next((g for g in ghosts if g.port == port_name), None)
+                if g:
+                    ok = cleanup_ghost_com_port(g)
+                    results.append((port_name, "✅ 已删除" if ok else "❌ 失败"))
+                else:
+                    results.append((port_name, "❌ 未找到"))
+
+            # 显示结果
+            result_msg = "\n".join(f"{p}: {s}" for p, s in results)
+            success_count = sum(1 for _, s in results if "✅" in s)
+            messagebox.showinfo(
+                "清理结果",
+                f"成功清理 {success_count}/{len(results)} 个幽灵 COM 口\n\n{result_msg}"
+            )
+            self.refresh()
+
+        ttk.Button(btn_frame, text="删除选中",
+                   command=do_cleanup).pack(side=tk.RIGHT, padx=2)
+        ttk.Button(btn_frame, text="取消",
+                   command=top.destroy).pack(side=tk.RIGHT, padx=2)
+
     def _find_group_for_device(self, dev: USBDevice) -> Optional[str]:
         """返回设备所属的分组 iid，或 None。"""
         key = dev.group_key
@@ -371,8 +507,6 @@ class USBGUI:
 
     def _stop_monitor(self):
         self._monitor_active = False
-        if hasattr(self, '_monitor_thread') and self._monitor_thread.is_alive():
-            self._monitor_thread.join(timeout=3.0)
         self.btn_monitor.config(text="▶ 实时监控")
         self.btn_refresh.config(state=tk.NORMAL)
         total = len(self.tree.get_children())
