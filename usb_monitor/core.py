@@ -369,3 +369,193 @@ def group_devices(devices: List[USBDevice]) -> List[DeviceGroup]:
     # 按父节点名称排序输出
     result = sorted(groups.values(), key=lambda g: g.display_name.lower())
     return result
+
+
+# ---------------------------------------------------------------------------
+# 幽灵 COM 口检测与清理
+# ---------------------------------------------------------------------------
+
+@dataclass
+class GhostComPort:
+    """一个幽灵 COM 口的信息。"""
+    port: str           # COM 编号，如 "COM12"
+    vid_pid: str        # VID 和 PID，如 "VID_0D28&PID_0204"
+    instance: str       # 实例标识
+    device_name: str = ""  # 设备名称（如能获取到）
+
+    @property
+    def is_active(self) -> bool:
+        """是否当前有物理设备占用此 COM 口。"""
+        return False  # 幽灵口意味着不在活动列表中
+
+
+def scan_ghost_com_ports() -> List[GhostComPort]:
+    """
+    扫描幽灵 COM 口：
+    对比注册表中所有 USB COM 口分配记录 与 当前活动 COM 口列表，
+    返回没有实际设备连接但仍被占用的 COM 口。
+    
+    需要管理员权限才能读取完整的注册表信息。
+    """
+    import winreg
+    
+    active_ports: set[str] = set()
+    ghost_ports: List[GhostComPort] = []
+
+    # 1. 获取当前活动的 COM 口
+    try:
+        key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                             r"HARDWARE\DEVICEMAP\SERIALCOMM")
+        i = 0
+        while True:
+            _, value, _ = winreg.EnumValue(key, i)
+            active_ports.add(str(value).upper())
+            i += 1
+    except WindowsError:
+        pass
+    finally:
+        winreg.CloseKey(key)
+
+    # 2. 扫描 USB 枚举中所有带 COM 口的设备记录
+    try:
+        usb_key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                                 r"SYSTEM\CurrentControlSet\Enum\USB")
+    except Exception as e:
+        raise RuntimeError(f"无法打开注册表（可能需要管理员权限）: {e}")
+
+    i = 0
+    while True:
+        try:
+            vid_pid = winreg.EnumKey(usb_key, i)
+        except WindowsError:
+            break  # 枚举完毕
+        i += 1
+
+        if "VID_" not in vid_pid:
+            continue
+        try:
+            inst_key = winreg.OpenKey(usb_key, vid_pid)
+        except Exception:
+            continue
+        j = 0
+        while True:
+            try:
+                inst = winreg.EnumKey(inst_key, j)
+            except WindowsError:
+                break
+            j += 1
+            try:
+                params = winreg.OpenKey(inst_key,
+                                        inst + r"\Device Parameters")
+                port_name, _ = winreg.QueryValueEx(params, "PortName")
+                winreg.CloseKey(params)
+
+                port_upper = str(port_name).upper()
+                dev_name = ""
+                try:
+                    dev_key = winreg.OpenKey(inst_key, inst)
+                    try:
+                        ff, _ = winreg.QueryValueEx(dev_key, "FriendlyName")
+                        dev_name = str(ff)
+                    except Exception:
+                        pass
+                    try:
+                        dd, _ = winreg.QueryValueEx(dev_key, "DeviceDesc")
+                        dev_name = dev_name or str(dd)
+                    except Exception:
+                        pass
+                    winreg.CloseKey(dev_key)
+                except Exception:
+                    pass
+
+                if port_upper not in active_ports:
+                    ghost_ports.append(GhostComPort(
+                        port=str(port_name),
+                        vid_pid=vid_pid,
+                        instance=inst,
+                        device_name=dev_name,
+                    ))
+            except Exception:
+                pass
+        winreg.CloseKey(inst_key)
+    winreg.CloseKey(usb_key)
+
+    # 按 COM 编号排序
+    def _com_sort_key(p: GhostComPort):
+        num = p.port[3:]  # "COM12" -> "12"
+        try:
+            return int(num)
+        except ValueError:
+            return 999
+
+    ghost_ports.sort(key=_com_sort_key)
+    return ghost_ports
+
+
+def cleanup_ghost_com_port(port: GhostComPort) -> bool:
+    """
+    删除一个幽灵 COM 口的注册表记录。
+    需要管理员权限。
+    """
+    import subprocess
+    import winreg
+
+    # 方法1: 使用 pnputil (Windows 10/11 内置)
+    instance_id = f"USB\\{port.vid_pid}\\{port.instance}"
+    try:
+        result = subprocess.run(
+            ["pnputil", "/remove-device", instance_id],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode == 0:
+            return True
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+
+    # 方法2: 使用 devcon (如果有)
+    try:
+        result = subprocess.run(
+            ["devcon", "remove", instance_id],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode == 0:
+            return True
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+
+    # 方法3: 直接删除注册表键 (需要管理员权限)
+    try:
+        key_path = f"SYSTEM\\CurrentControlSet\\Enum\\USB\\{port.vid_pid}\\{port.instance}"
+        # 先尝试删除子键
+        def _del_key(root, path):
+            try:
+                k = winreg.OpenKey(root, path, 0, winreg.KEY_ALL_ACCESS)
+                # 删除所有子键
+                while True:
+                    try:
+                        sub_name = winreg.EnumKey(k, 0)
+                        _del_key(k, sub_name)
+                    except WindowsError:
+                        break
+                winreg.CloseKey(k)
+                winreg.DeleteKey(root, path)
+                return True
+            except Exception:
+                return False
+
+        return _del_key(winreg.HKEY_LOCAL_MACHINE, key_path)
+    except Exception:
+        pass
+
+    return False
+
+
+def cleanup_all_ghost_com_ports(ports: List[GhostComPort]) -> dict[str, bool]:
+    """
+    批量清理幽灵 COM 口。
+    返回 {COM口: 是否成功} 的字典。
+    """
+    results = {}
+    for port in ports:
+        results[port.port] = cleanup_ghost_com_port(port)
+    return results
